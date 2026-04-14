@@ -1,0 +1,466 @@
+diff --git a/libs/nvdsinfer/nvdsinfer_context_impl.cpp b/libs/nvdsinfer/nvdsinfer_context_impl.cpp
+index 2a39401..d0d589a 100644
+--- a/libs/nvdsinfer/nvdsinfer_context_impl.cpp
++++ b/libs/nvdsinfer/nvdsinfer_context_impl.cpp
+@@ -2257,7 +2257,14 @@ NvDsInferContextImpl::buildModel(NvDsInferContextInitParams& initParams)
+ 
+ /* Deserialize engine and create backend context for the model from the init
+  * params (caffemodel & prototxt/uff/onnx/etlt&key/custom-parser, int8
+- * calibration tables, etc) and return the backend */
++ * calibration tables, etc) and return the backend.
++ *
++ * Engine file search order:
++ * 1. FIRST: Try to read from model-engine-file specified in config
++ * 2. SECOND: If not found, search for engine file with standardized naming pattern
++ *    Format: {model}_b{batch}_i{width}x{height}_{compute_cap}_{gpu_model}_{trt_version}_{precision}.engine
++ * 3. THIRD: Only if not found, generate new engine file
++ */
+ 
+ std::unique_ptr<BackendContext>
+ NvDsInferContextImpl::generateBackendContext(NvDsInferContextInitParams& initParams)
+@@ -2268,35 +2275,112 @@ NvDsInferContextImpl::generateBackendContext(NvDsInferContextInitParams& initPar
+ 
+     std::shared_ptr<TrtEngine> engine;
+     std::unique_ptr<BackendContext> backend;
++
++    /* ========================================================================
++     * STEP 1: Try to load engine from path specified in config file
++     * ======================================================================== */
+     if (!string_empty(initParams.modelEngineFilePath))
+     {
++        printInfo("Step 1: Trying to load engine from config path: %s",
++            safeStr(initParams.modelEngineFilePath));
++
+         if (!deserializeEngineAndBackend(
+                 initParams.modelEngineFilePath, dla, engine, backend))
+         {
+             printWarning(
+-                "deserialize backend context from engine from file :%s failed, "
+-                "try rebuild",
++                "deserialize backend context from engine from file :%s failed",
+                 safeStr(initParams.modelEngineFilePath));
+         }
++        else if (backend && checkBackendParams(*backend, initParams) == NVDSINFER_SUCCESS)
++        {
++            printInfo("Successfully loaded engine from config path: %s",
++                safeStr(initParams.modelEngineFilePath));
++            return backend;
++        }
++        else if (backend)
++        {
++            printWarning(
++                "deserialized backend context :%s failed to match config params",
++                safeStr(initParams.modelEngineFilePath));
++            backend.reset();
++            engine.reset();
++        }
+     }
+ 
+-    if (backend &&
+-        checkBackendParams(*backend, initParams) == NVDSINFER_SUCCESS)
++    /* ========================================================================
++     * STEP 2: Try to find engine file with standardized naming pattern
++     * This allows reusing previously generated engines for the same configuration
++     * ======================================================================== */
++    std::string modelPath;
++
++    if (!string_empty(initParams.onnxFilePath))
+     {
+-        printInfo("Use deserialized engine model: %s",
+-            safeStr(initParams.modelEngineFilePath));
+-        return backend;
++        modelPath = initParams.onnxFilePath;
+     }
+-    else if (backend)
++    else if (!string_empty(initParams.tltEncodedModelFilePath))
+     {
+-        printWarning(
+-            "deserialized backend context :%s failed to match config params, "
+-            "trying rebuild",
+-            safeStr(initParams.modelEngineFilePath));
+-        backend.reset();
+-        engine.reset();
++        modelPath = initParams.tltEncodedModelFilePath;
++    }
++    else if (!string_empty(initParams.modelFilePath))
++    {
++        modelPath = initParams.modelFilePath;
+     }
+ 
++    if (!modelPath.empty())
++    {
++        std::string standardizedEnginePath = generateEngineFilePath(
++            modelPath,
++            initParams.maxBatchSize,
++            initParams.inferInputDims.w,
++            initParams.inferInputDims.h,
++            m_GpuID,
++            dla,
++            initParams.networkMode);
++
++        printInfo("Step 2: Looking for engine with standardized name: %s",
++            standardizedEnginePath.c_str());
++
++        if (engineFileExists(standardizedEnginePath))
++        {
++            printInfo("Found existing engine file: %s", standardizedEnginePath.c_str());
++
++            if (deserializeEngineAndBackend(standardizedEnginePath, dla, engine, backend))
++            {
++                if (backend && checkBackendParams(*backend, initParams) == NVDSINFER_SUCCESS)
++                {
++                    printInfo("Successfully loaded engine from standardized path: %s",
++                        standardizedEnginePath.c_str());
++                    return backend;
++                }
++                else if (backend)
++                {
++                    printWarning(
++                        "Engine at standardized path %s failed to match config params, "
++                        "will rebuild",
++                        standardizedEnginePath.c_str());
++                    backend.reset();
++                    engine.reset();
++                }
++            }
++            else
++            {
++                printWarning(
++                    "Failed to deserialize engine from standardized path: %s, will rebuild",
++                    standardizedEnginePath.c_str());
++            }
++        }
++        else
++        {
++            printInfo("No existing engine found at standardized path: %s",
++                standardizedEnginePath.c_str());
++        }
++    }
++
++    /* ========================================================================
++     * STEP 3: Build new engine from model files
++     * ======================================================================== */
++    printInfo("Step 3: Building new engine from model files");
++
+     backend = buildModel(initParams);
+     if (!backend)
+     {
+diff --git a/libs/nvdsinfer/nvdsinfer_model_builder.cpp b/libs/nvdsinfer/nvdsinfer_model_builder.cpp
+index ac99fb8..ab8d17a 100644
+--- a/libs/nvdsinfer/nvdsinfer_model_builder.cpp
++++ b/libs/nvdsinfer/nvdsinfer_model_builder.cpp
+@@ -12,6 +12,7 @@
+ 
+ #include <dlfcn.h>
+ #include <unistd.h>
++#include <sys/stat.h>
+ #include <array>
+ #include <fstream>
+ #include <iomanip>
+@@ -25,6 +26,7 @@
+ #include <NvInferPlugin.h>
+ #include <NvOnnxParser.h>
+ #include <NvInferVersion.h>
++#include <cuda_runtime_api.h>
+ 
+ #include "nvdsinfer.h"
+ #include "nvdsinfer_custom_impl.h"
+@@ -34,6 +36,186 @@
+ 
+ namespace nvdsinfer {
+ 
++/* ============================================================================
++ * Engine File Naming Helper Functions
++ * These functions generate standardized engine file names that include:
++ * - Model name, batch size, input dimensions
++ * - GPU compute capability (architecture-specific)
++ * - TensorRT version (version-specific)
++ * - Precision mode (fp32, fp16, int8, best)
++ * ============================================================================ */
++
++std::string getGpuComputeCapability(int gpuId)
++{
++    cudaDeviceProp prop;
++    cudaError_t err = cudaGetDeviceProperties(&prop, gpuId);
++    if (err != cudaSuccess)
++    {
++        dsInferWarning("Failed to get GPU properties for device %d: %s",
++            gpuId, cudaGetErrorString(err));
++        return "unknown";
++    }
++
++    // Format: sm{major}{minor}, e.g., sm86 for compute capability 8.6
++    std::stringstream ss;
++    ss << "sm" << prop.major << prop.minor;
++    return ss.str();
++}
++
++std::string getGpuModelName(int gpuId)
++{
++    cudaDeviceProp prop;
++    cudaError_t err = cudaGetDeviceProperties(&prop, gpuId);
++    if (err != cudaSuccess)
++    {
++        dsInferWarning("Failed to get GPU properties for device %d: %s",
++            gpuId, cudaGetErrorString(err));
++        return "unknown";
++    }
++
++    std::string gpuName = prop.name;
++
++    // Remove common prefixes to get a shorter, cleaner name
++    const std::vector<std::string> prefixes = {
++        "NVIDIA GeForce ",
++        "NVIDIA GEFORCE ",
++        "GeForce ",
++        "GEFORCE ",
++        "NVIDIA ",
++        "Tesla ",
++        "TESLA ",
++        "Quadro ",
++        "QUADRO "
++    };
++
++    for (const auto& prefix : prefixes)
++    {
++        if (gpuName.find(prefix) == 0)
++        {
++            gpuName = gpuName.substr(prefix.length());
++            break;
++        }
++    }
++
++    // Sanitize: convert to lowercase, remove spaces and special characters
++    std::string sanitized;
++    sanitized.reserve(gpuName.length());
++
++    for (char c : gpuName)
++    {
++        if (std::isalnum(c))
++        {
++            sanitized += std::tolower(c);
++        }
++    }
++
++    return sanitized.empty() ? "unknown" : sanitized;
++}
++
++std::string getTensorRTVersion()
++{
++    int major = NV_TENSORRT_MAJOR;
++    int minor = NV_TENSORRT_MINOR;
++
++    std::stringstream ss;
++    ss << "trt" << major << "." << minor;
++    return ss.str();
++}
++
++/**
++ * Extract the base model name from a file path.
++ * Removes directory path and common model file extensions.
++ */
++static std::string extractModelBaseName(const std::string& modelPath)
++{
++    size_t lastSlash = modelPath.find_last_of("/\\");
++    std::string filename = (lastSlash != std::string::npos)
++        ? modelPath.substr(lastSlash + 1)
++        : modelPath;
++
++    const std::vector<std::string> extensions = {
++        ".onnx", ".ONNX",
++        ".uff", ".UFF",
++        ".caffemodel", ".CAFFEMODEL",
++        ".prototxt", ".PROTOTXT",
++        ".etlt", ".ETLT",
++        ".engine", ".ENGINE"
++    };
++
++    for (const auto& ext : extensions)
++    {
++        if (filename.length() > ext.length())
++        {
++            size_t pos = filename.rfind(ext);
++            if (pos != std::string::npos && pos == filename.length() - ext.length())
++            {
++                filename = filename.substr(0, pos);
++                break;
++            }
++        }
++    }
++
++    return filename;
++}
++
++/**
++ * Extract the directory path from a file path.
++ */
++static std::string extractDirectory(const std::string& filePath)
++{
++    size_t lastSlash = filePath.find_last_of("/\\");
++    if (lastSlash != std::string::npos)
++    {
++        return filePath.substr(0, lastSlash + 1);
++    }
++    return "./";
++}
++
++std::string generateEngineFilePath(
++    const std::string& modelPath,
++    int batchSize,
++    int inputWidth,
++    int inputHeight,
++    int gpuId,
++    int dlaCore,
++    NvDsInferNetworkMode networkMode)
++{
++    std::stringstream ss;
++
++    std::string directory = extractDirectory(modelPath);
++    std::string modelName = extractModelBaseName(modelPath);
++
++    ss << directory << modelName;
++    ss << "_b" << batchSize;
++
++    if (inputWidth > 0 && inputHeight > 0)
++    {
++        ss << "_i" << inputWidth << "x" << inputHeight;
++    }
++
++    if (dlaCore >= 0)
++    {
++        ss << "_dla" << dlaCore;
++    }
++    else
++    {
++        ss << "_" << getGpuComputeCapability(gpuId);
++        ss << "_" << getGpuModelName(gpuId);
++    }
++
++    ss << "_" << getTensorRTVersion();
++    ss << "_" << networkMode2Str(networkMode);
++    ss << ".engine";
++
++    return ss.str();
++}
++
++bool engineFileExists(const std::string& enginePath)
++{
++    struct stat buffer;
++    return (stat(enginePath.c_str(), &buffer) == 0);
++}
++
+ /* Helper function to check if TensorRT version is 10.x or higher */
+ static bool isTrt10OrHigher()
+ {
+@@ -599,16 +781,26 @@ TrtModelBuilder::buildModel(const NvDsInferContextInitParams& initParams,
+         networkMode = m_Options->networkMode;
+     }
+ 
+-    std::string devId = std::string("gpu") + std::to_string(m_GpuId);
+-    if (initParams.useDLA && initParams.dlaCore >= 0)
+-    {
+-        devId = std::string("dla") + std::to_string(initParams.dlaCore);
+-    }
++    int dlaCore = (initParams.useDLA && initParams.dlaCore >= 0) ? initParams.dlaCore : -1;
++
++    int inputWidth = initParams.inferInputDims.w;
++    int inputHeight = initParams.inferInputDims.h;
++
++    /* Construct the suggested path for engine file using standardized naming.
++     * Format: {model}_b{batch}_i{width}x{height}_{compute_cap}_{gpu_model}_{trt_version}_{precision}.engine
++     * Example: model_b8_i640x640_sm86_rtx3090_trt10.7_fp16.engine
++     */
++    suggestedPathName = generateEngineFilePath(
++        modelPath,
++        initParams.maxBatchSize,
++        inputWidth,
++        inputHeight,
++        m_GpuId,
++        dlaCore,
++        networkMode);
++
++    dsInferInfo("Generated engine file path: %s", suggestedPathName.c_str());
+ 
+-    /* Construct the suggested path for engine file. */
+-    suggestedPathName =
+-        modelPath + "_b" + std::to_string(initParams.maxBatchSize) + "_" +
+-        devId + "_" + networkMode2Str(networkMode) + ".engine";
+     return engine;
+ }
+ 
+diff --git a/libs/nvdsinfer/nvdsinfer_model_builder.h b/libs/nvdsinfer/nvdsinfer_model_builder.h
+index 63e60b5..f7a8ae5 100644
+--- a/libs/nvdsinfer/nvdsinfer_model_builder.h
++++ b/libs/nvdsinfer/nvdsinfer_model_builder.h
+@@ -349,6 +349,71 @@ private:
+         nvinfer1::ICudaEngine *& cudaEngine);
+ };
+ 
++/**
++ * Helper functions for engine file naming with hardware/software versioning.
++ * This ensures engine files are properly identified by:
++ * - Model name and parameters (batch size, input dimensions)
++ * - GPU compute capability (architecture)
++ * - TensorRT version
++ * - Precision mode (fp32, fp16, int8, best)
++ */
++
++/**
++ * Get GPU compute capability string (e.g., "sm86" for compute capability 8.6)
++ * @param gpuId GPU device ID
++ * @return Compute capability string or "unknown" on failure
++ */
++std::string getGpuComputeCapability(int gpuId);
++
++/**
++ * Get GPU model name sanitized for use in filenames (e.g., "rtx3090", "a100")
++ * Removes spaces, special characters, and common prefixes like "NVIDIA GeForce"
++ * @param gpuId GPU device ID
++ * @return Sanitized GPU model name or "unknown" on failure
++ */
++std::string getGpuModelName(int gpuId);
++
++/**
++ * Get TensorRT version string (e.g., "trt10.7")
++ * @return TensorRT version string
++ */
++std::string getTensorRTVersion();
++
++/**
++ * Generate standardized engine file path with all identifying parameters.
++ * Format: {model}_b{batch}_i{width}x{height}_{compute_cap}_{gpu_model}_{trt_version}_{precision}.engine
++ * Example: model_b8_i640x640_sm86_rtx3090_trt10.7_fp16.engine
++ *
++ * Including both compute capability AND GPU model name ensures:
++ * - Engines are truly optimized for the specific GPU (not just architecture)
++ * - RTX 3090 and RTX 3070 (both sm86) will have separate optimized engines
++ * - Different GPU models with same arch won't use suboptimal engines
++ *
++ * @param modelPath Base model file path (used to extract model name and directory)
++ * @param batchSize Maximum batch size
++ * @param inputWidth Network input width (0 if not specified)
++ * @param inputHeight Network input height (0 if not specified)
++ * @param gpuId GPU device ID (used to get compute capability and model name)
++ * @param dlaCore DLA core ID (-1 if not using DLA)
++ * @param networkMode Network precision mode
++ * @return Standardized engine file path
++ */
++std::string generateEngineFilePath(
++    const std::string& modelPath,
++    int batchSize,
++    int inputWidth,
++    int inputHeight,
++    int gpuId,
++    int dlaCore,
++    NvDsInferNetworkMode networkMode);
++
++/**
++ * Check if an engine file exists at the given path.
++ * @param enginePath Path to check
++ * @return true if file exists and is accessible
++ */
++bool engineFileExists(const std::string& enginePath);
++
+ } // end of namespace nvdsinfer
+ 
+ #endif
