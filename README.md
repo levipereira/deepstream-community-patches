@@ -6,9 +6,8 @@ Patches are grouped **by DeepStream version** first, then by component and featu
 
 ## Legal notice
 
-- Patches are **incremental diffs**. You must **lawfully possess** the matching DeepStream / NVIDIA sources (e.g. from your SDK install) before applying them.
-- **Do not** commit full copies of proprietary NVIDIA components here.
-- Licensing of contributed hunks is up to contributors; add a root `LICENSE` if you want to clarify your own work.
+- Patches are **incremental diffs**. You must **lawfully possess** the matching DeepStream / NVIDIA sources before applying them.
+
 
 ## Index by DeepStream version
 
